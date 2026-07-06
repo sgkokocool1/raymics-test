@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>具身智能数据平台 · 原型</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b1220; --panel: #131c31; --panel2: #1a2540; --line: #26324f;
+      --txt: #e6ecf5; --muted: #8aa0c6; --brand: #4f8cff; --brand2: #37e0c8;
+      --ok: #2ec17a; --warn: #f5a623; --err: #ff5b6a; --chip: #223056;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--txt); }
+    #app { display: flex; min-height: 100vh; }
+    /* Sidebar */
+    .sidebar { width: 232px; background: linear-gradient(180deg, #0e1730, #0b1220); border-right: 1px solid var(--line); padding: 18px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+    .logo { display: flex; align-items: center; gap: 10px; padding: 6px 10px 18px; font-weight: 700; font-size: 16px; }
+    .logo .dot { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, var(--brand), var(--brand2)); display: grid; place-items: center; font-size: 15px; }
+    .nav-group { color: var(--muted); font-size: 11px; letter-spacing: 1px; margin: 14px 12px 6px; text-transform: uppercase; }
+    .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 9px; color: var(--muted); cursor: pointer; font-size: 14px; transition: .15s; }
+    .nav-item:hover { background: var(--panel2); color: var(--txt); }
+    .nav-item.active { background: linear-gradient(90deg, rgba(79,140,255,.22), rgba(55,224,200,.08)); color: #fff; box-shadow: inset 0 0 0 1px rgba(79,140,255,.35); }
+    .nav-item .ic { width: 18px; text-align: center; }
+    /* Main */
+    .main { flex: 1; padding: 22px 26px 60px; overflow-x: hidden; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+    .topbar h1 { font-size: 20px; }
+    .topbar .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .pill { background: var(--chip); color: var(--muted); border-radius: 20px; padding: 5px 12px; font-size: 12px; }
+    /* Cards */
+    .grid { display: grid; gap: 16px; }
+    .kpis { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+    .card h3 { font-size: 13px; color: var(--muted); font-weight: 500; margin-bottom: 10px; }
+    .kpi .val { font-size: 28px; font-weight: 700; }
+    .kpi .val span { font-size: 14px; color: var(--muted); font-weight: 500; margin-left: 4px; }
+    .kpi .delta { font-size: 12px; margin-top: 6px; }
+    .kpi .delta.up { color: var(--ok); } .kpi .delta.down { color: var(--err); }
+    .chart { width: 100%; height: 280px; }
+    .chart.sm { height: 240px; }
+    .cols-2 { grid-template-columns: repeat(2, 1fr); }
+    .cols-3 { grid-template-columns: repeat(3, 1fr); }
+    @media (max-width: 1100px) { .cols-2, .cols-3 { grid-template-columns: 1fr; } }
+    /* Table */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+    tbody tr:hover { background: var(--panel2); cursor: pointer; }
+    .tbl-wrap { max-height: 560px; overflow: auto; border-radius: 12px; }
+    /* chips / badges */
+    .chip { display: inline-block; background: var(--chip); color: var(--muted); border-radius: 14px; padding: 3px 9px; font-size: 11px; margin: 2px 3px 2px 0; cursor: pointer; }
+    .chip.on { background: var(--brand); color: #fff; }
+    .badge { display: inline-block; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 600; }
+    .b-ok { background: rgba(46,193,122,.15); color: var(--ok); }
+    .b-warn { background: rgba(245,166,35,.15); color: var(--warn); }
+    .b-err { background: rgba(255,91,106,.15); color: var(--err); }
+    .b-info { background: rgba(79,140,255,.15); color: var(--brand); }
+    .grade-A { color: var(--ok); font-weight: 700; } .grade-B { color: var(--warn); font-weight: 700; } .grade-C { color: var(--err); font-weight: 700; }
+    /* filters */
+    .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+    select, input { background: var(--panel2); border: 1px solid var(--line); color: var(--txt); border-radius: 9px; padding: 8px 11px; font-size: 13px; outline: none; }
+    input::placeholder { color: var(--muted); }
+    .btn { background: var(--brand); color: #fff; border: none; border-radius: 9px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+    .btn.ghost { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
+    /* detail */
+    .cam { background: #05080f; border: 1px solid var(--line); border-radius: 10px; height: 150px; display: grid; place-items: center; color: var(--muted); font-size: 12px; position: relative; overflow: hidden; }
+    .cam .play { position: absolute; width: 44px; height: 44px; border-radius: 50%; background: rgba(79,140,255,.85); display: grid; place-items: center; }
+    .meta-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed var(--line); font-size: 13px; }
+    .meta-row .k { color: var(--muted); }
+    .steps { display: flex; flex-wrap: wrap; gap: 6px; }
+    .step { padding: 6px 10px; border-radius: 8px; font-size: 11px; background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
+    .step.done { background: rgba(46,193,122,.12); color: var(--ok); border-color: rgba(46,193,122,.3); }
+    .step.cur { background: rgba(79,140,255,.15); color: var(--brand); border-color: rgba(79,140,255,.4); }
+    .mermaid { background: #fff; border-radius: 12px; padding: 18px; overflow: auto; }
+    .progress { height: 7px; background: var(--panel2); border-radius: 5px; overflow: hidden; }
+    .progress > div { height: 100%; background: linear-gradient(90deg, var(--brand), var(--brand2)); }
+    a.link { color: var(--brand); cursor: pointer; }
+    .facet { background: var(--panel2); border-radius: 12px; padding: 12px 14px; }
+    .facet h4 { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .facet .f { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; cursor: pointer; }
+    .facet .f:hover { color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="logo"><span class="dot">具</span> 具身数据平台</div>
+      <div class="nav-group">概览</div>
+      <div id="nav"></div>
+    </aside>
+    <main class="main" id="main"></main>
+  </div>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
