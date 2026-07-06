@@ -31,7 +31,7 @@ export interface Dataset { id: string; name: string; episodes: number; hours: nu
 export interface TrainingJob { id: string; name: string; dataset: string; policy: string; status: string; progress: number; success_rate: number; gpu: string; }
 export interface Pipeline { jobs: { id: string; type: string; target: string; status: string; count: number }[]; cleanRules: { rule: string; count: number }[]; }
 export interface AnnoTask { id: string; episode: string; type: string; assignee: string; status: string; progress: number; }
-export interface SearchResult { total: number; items: Episode[]; facets: Record<string, Record<string, number>>; }
+export interface SearchResult { total: number; items: Episode[]; facets: Record<string, Record<string, number>>; engine?: string; }
 
 export const api = {
   stats: () => get<Stats>('/stats'),

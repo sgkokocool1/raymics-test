@@ -27,7 +27,8 @@ export default function Search() {
 
   return (
     <>
-      <TopBar title="检索中心" sub="结构化过滤 + 全文 + 语义（向量）混合检索 · 分面下钻 · 相似检索" />
+      <TopBar title="检索中心" sub="结构化过滤 + 全文 + 语义（向量）混合检索 · 分面下钻 · 相似检索"
+        extra={result?.engine && <span className="pill">检索引擎：{result.engine}</span>} />
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="filters">
           <input placeholder='自然语言，如 "抓取失败案例"' style={{ minWidth: 280 }} value={q}
