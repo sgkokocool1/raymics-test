@@ -1,0 +1,20 @@
+{
+  "name": "feishu-recall-viewer",
+  "version": "1.0.0",
+  "description": "飞书撤回消息查看器：机器人先存消息，再监听撤回事件，在 Web 面板查看被撤回内容",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed:demo": "node src/seed-demo.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}

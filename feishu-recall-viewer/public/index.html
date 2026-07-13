@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>飞书撤回消息查看器</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --panel2: #243044;
+      --line: #2f3f56;
+      --txt: #e8eef7;
+      --muted: #8b9cb3;
+      --brand: #3370ff;
+      --brand2: #00d6b9;
+      --warn: #f5a623;
+      --err: #f54a45;
+      --ok: #34c759;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1a2a4a 0%, transparent 50%),
+                  radial-gradient(900px 500px at 100% 0%, #12353a 0%, transparent 45%),
+                  var(--bg);
+      color: var(--txt);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 22px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: linear-gradient(135deg, var(--brand), var(--brand2));
+      display: grid; place-items: center; font-weight: 800; font-size: 18px;
+    }
+    h1 { font-size: 22px; font-weight: 700; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .kpi {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px;
+    }
+    .kpi .l { color: var(--muted); font-size: 12px; }
+    .kpi .v { font-size: 26px; font-weight: 700; margin-top: 4px; }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; align-items: center;
+    }
+    input, select, button {
+      background: var(--panel2); border: 1px solid var(--line); color: var(--txt);
+      border-radius: 10px; padding: 9px 12px; font-size: 13px; outline: none;
+    }
+    input { min-width: 220px; }
+    button { background: var(--brand); border-color: transparent; cursor: pointer; font-weight: 600; }
+    button.ghost { background: var(--panel2); border-color: var(--line); color: var(--muted); }
+    .list { display: grid; gap: 12px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px;
+      transition: border-color .15s;
+    }
+    .card:hover { border-color: #4a6285; }
+    .card .meta { display: flex; flex-wrap: wrap; gap: 8px 14px; color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+    .badge {
+      display: inline-block; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 600;
+      background: rgba(245,74,69,.15); color: var(--err);
+    }
+    .badge.type { background: rgba(51,112,255,.15); color: #7aa2ff; }
+    .badge.chat { background: rgba(0,214,185,.12); color: var(--brand2); }
+    .content {
+      font-size: 15px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+      background: rgba(0,0,0,.22); border-radius: 10px; padding: 12px 14px;
+    }
+    .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+    .hint {
+      margin-top: 22px; background: var(--panel); border: 1px dashed var(--line); border-radius: 14px;
+      padding: 16px 18px; color: var(--muted); font-size: 13px; line-height: 1.7;
+    }
+    .hint code { background: var(--panel2); padding: 1px 6px; border-radius: 4px; color: #c9d7ea; }
+    .footer { margin-top: 18px; color: var(--muted); font-size: 12px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo">撤</div>
+        <div>
+          <h1>飞书撤回消息查看器</h1>
+          <div class="sub">机器人先存消息 → 监听撤回事件 → 在此查看原文</div>
+        </div>
+      </div>
+      <button class="ghost" id="btnRefresh">刷新</button>
+    </header>
+
+    <div class="kpis" id="kpis">
+      <div class="kpi"><div class="l">已撤回</div><div class="v" id="k_recalled">-</div></div>
+      <div class="kpi"><div class="l">已存消息</div><div class="v" id="k_total">-</div></div>
+      <div class="kpi"><div class="l">未撤回</div><div class="v" id="k_active">-</div></div>
+    </div>
+
+    <div class="toolbar">
+      <input id="q" placeholder="搜索内容 / 发送者 / message_id…" />
+      <select id="scope">
+        <option value="recalled">仅撤回</option>
+        <option value="all">全部已存消息</option>
+      </select>
+      <button id="btnSearch">查询</button>
+    </div>
+
+    <div class="list" id="list"><div class="empty">加载中…</div></div>
+
+    <div class="hint">
+      <b style="color:#e8eef7">接入说明（摘要）</b><br/>
+      1. 飞书开放平台创建企业自建应用，开启<strong>机器人</strong>能力<br/>
+      2. 权限：至少开通 <code>im:message</code> / <code>im:message:readonly</code>；若要收群内全部消息还需 <code>im:message.group_msg</code>（敏感权限）<br/>
+      3. 事件订阅：请求地址填 <code>https://你的域名/webhook/event</code>，订阅
+      <code>im.message.receive_v1</code> 与 <code>im.message.recalled_v1</code><br/>
+      4. 把机器人拉进需要监控的群；<strong>撤回事件本身不含原文</strong>，必须先收到并保存消息<br/>
+      5. 详细步骤见项目 README
+    </div>
+    <div class="footer">feishu-recall-viewer · 仅用于你有权管理的会话，请遵守企业合规与隐私政策</div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const token = new URLSearchParams(location.search).get('token') || localStorage.getItem('viewer_token') || '';
+    if (token) localStorage.setItem('viewer_token', token);
+
+    function headers() {
+      const h = {};
+      if (token) h['x-viewer-token'] = token;
+      return h;
+    }
+
+    function fmtTime(ms) {
+      if (!ms) return '-';
+      const d = new Date(Number(ms));
+      if (Number.isNaN(d.getTime())) return String(ms);
+      return d.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    async function loadStats() {
+      const r = await fetch('/api/stats', { headers: headers() });
+      if (!r.ok) throw new Error('stats ' + r.status);
+      const s = await r.json();
+      $('k_recalled').textContent = s.recalled;
+      $('k_total').textContent = s.total;
+      $('k_active').textContent = s.active;
+    }
+
+    async function loadList() {
+      const q = $('q').value.trim();
+      const recalledOnly = $('scope').value === 'recalled';
+      const params = new URLSearchParams({ recalledOnly: String(recalledOnly), q, size: '100' });
+      if (token) params.set('token', token);
+      const r = await fetch('/api/messages?' + params, { headers: headers() });
+      if (!r.ok) {
+        $('list').innerHTML = `<div class="empty">加载失败（${r.status}）。若设置了 VIEWER_TOKEN，请在 URL 加 ?token=你的令牌</div>`;
+        return;
+      }
+      const data = await r.json();
+      if (!data.items.length) {
+        $('list').innerHTML = '<div class="empty">暂无数据。可先运行 <code>npm run seed:demo</code> 查看演示，或接入飞书事件。</div>';
+        return;
+      }
+      $('list').innerHTML = data.items.map((m) => `
+        <article class="card">
+          <div class="meta">
+            ${m.recalled ? '<span class="badge">已撤回</span>' : '<span class="badge type">未撤回</span>'}
+            <span class="badge type">${m.message_type || 'unknown'}</span>
+            <span class="badge chat">${m.chat_type === 'p2p' ? '单聊' : '群聊'}</span>
+            <span>发送者：${m.sender_name || m.sender_id || '-'}</span>
+            <span>发送：${fmtTime(m.create_time)}</span>
+            ${m.recalled ? `<span>撤回：${fmtTime(m.recall_time)}（${m.recall_type_label || m.recall_type}）</span>` : ''}
+            <span>chat：${m.chat_id || '-'}</span>
+          </div>
+          <div class="content">${escapeHtml(m.content_text || '（无文本内容）')}</div>
+        </article>
+      `).join('');
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function refresh() {
+      try { await loadStats(); } catch (e) { console.warn(e); }
+      await loadList();
+    }
+
+    $('btnRefresh').onclick = refresh;
+    $('btnSearch').onclick = loadList;
+    $('q').onkeydown = (e) => { if (e.key === 'Enter') loadList(); };
+    refresh();
+  </script>
+</body>
+</html>
