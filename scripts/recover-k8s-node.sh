@@ -32,6 +32,7 @@ SKIP_CORDON=false
 WAIT_READY_TIMEOUT=300
 DOCKER_CMD_TIMEOUT=30
 RUNTIME_STOP_TIMEOUT=20
+SCOPE_STOP_TIMEOUT=5
 
 usage() {
   cat <<'EOF'
@@ -56,7 +57,7 @@ usage() {
   3. cordon 节点（可选）
   4. 重启容器运行时 (containerd/docker)
   5. 清理僵死容器（--hard / --deep）
-  6. 清理僵死 cgroup（--deep）
+  6. --deep: 先解冻 FROZEN cgroup → 杀残留进程 → 删 cgroup 目录 → 再清容器
   7. 重启 kubelet
   8. 等待节点恢复 Ready 并 uncordon
 EOF
@@ -409,15 +410,18 @@ get_cgroup_pids() {
 
 kill_pids() {
   local pids="$1"
+  local aggressive="${2:-false}"
   local pid
   for pid in $pids; do
     [[ -z "$pid" || "$pid" == "0" ]] && continue
     [[ -d "/proc/${pid}" ]] || continue
-    # 不杀 kubelet/dockerd/containerd 自身
     local comm
     comm="$(cat "/proc/${pid}/comm" 2>/dev/null || echo "")"
     case "$comm" in
-      kubelet|dockerd|containerd|containerd-shim|systemd|sshd) continue ;;
+      kubelet|dockerd|containerd|systemd|sshd) continue ;;
+      containerd-shim*|docker-containe*)
+        [[ "$aggressive" == true ]] || continue
+        ;;
     esac
     log "    SIGKILL pid=${pid} comm=${comm}"
     if [[ "$DRY_RUN" != true ]]; then
@@ -426,41 +430,103 @@ kill_pids() {
   done
 }
 
+# 解冻 cgroup v1 freezer.state / v2 cgroup.freeze
+thaw_cgroup_freezer_file() {
+  local state_file="$1"
+  local cgdir state
+
+  [[ -f "$state_file" ]] || return 0
+  cgdir="$(dirname "$state_file")"
+
+  case "$(basename "$state_file")" in
+    cgroup.freeze)
+      state="$(cat "$state_file" 2>/dev/null | tr -d '[:space:]')"
+      if [[ "$state" == "1" ]]; then
+        log "    解冻 cgroup v2: ${cgdir}"
+        if [[ "$DRY_RUN" != true ]]; then
+          echo 0 >"$state_file" 2>/dev/null || true
+        fi
+      fi
+      ;;
+    freezer.state)
+      state="$(cat "$state_file" 2>/dev/null | tr -d '[:space:]')"
+      if [[ "$state" == FROZEN* ]]; then
+        log "    解冻 cgroup v1: ${cgdir} (was ${state})"
+        if [[ "$DRY_RUN" != true ]]; then
+          echo THAW >"$state_file" 2>/dev/null || true
+        fi
+      fi
+      ;;
+  esac
+}
+
+thaw_all_frozen_cgroups() {
+  log "检查并解冻 FROZEN 的 cgroup"
+  local state_file
+
+  # cgroup v1: /sys/fs/cgroup/freezer/.../freezer.state
+  while IFS= read -r state_file; do
+    [[ -z "$state_file" ]] && continue
+    thaw_cgroup_freezer_file "$state_file"
+  done < <(find /sys/fs/cgroup/freezer -name 'freezer.state' 2>/dev/null || true)
+
+  # cgroup v2: cgroup.freeze（可能在统一层级或各子系统下）
+  while IFS= read -r state_file; do
+    [[ -z "$state_file" ]] && continue
+    thaw_cgroup_freezer_file "$state_file"
+  done < <(find /sys/fs/cgroup -path '*/kubepods*' -name 'cgroup.freeze' 2>/dev/null || true)
+
+  while IFS= read -r state_file; do
+    [[ -z "$state_file" ]] && continue
+    thaw_cgroup_freezer_file "$state_file"
+  done < <(find /sys/fs/cgroup -path '*/docker-*.scope' -name 'cgroup.freeze' 2>/dev/null || true)
+}
+
+# 不阻塞：systemctl stop scope 在僵死节点上会卡死，deep 模式不调用此函数
 stop_systemd_docker_scopes() {
-  log "停止 systemd docker scope 单元"
+  log "尝试停止 systemd docker scope（每项 ${SCOPE_STOP_TIMEOUT}s 超时）"
   local unit
   while IFS= read -r unit; do
     [[ -z "$unit" ]] && continue
-    log "    systemctl stop ${unit}"
+    log "    systemctl kill --kill-who=all ${unit}"
     if [[ "$DRY_RUN" != true ]]; then
-      systemctl stop "$unit" 2>/dev/null || true
+      timeout "$SCOPE_STOP_TIMEOUT" systemctl kill --kill-who=all "$unit" >>"$LOG_FILE" 2>&1 \
+        || log "    超时/失败，跳过: ${unit}"
     fi
   done < <(systemctl list-units --type=scope --all --no-legend 2>/dev/null \
     | awk '/docker-.*\.scope/ {print $1}' || true)
 }
 
+kill_cgroup_processes_round() {
+  local aggressive="${1:-false}"
+  kill_processes_in_docker_scopes "$aggressive"
+  kill_processes_in_orphan_pod_slices "$aggressive"
+}
+
 kill_processes_in_docker_scopes() {
-  log "杀死 docker cgroup scope 中的残留进程"
+  local aggressive="${1:-false}"
+  log "杀死 docker cgroup scope 中的残留进程 (aggressive=${aggressive})"
   local scope pids
   while IFS= read -r scope; do
     [[ -z "$scope" ]] && continue
     pids="$(get_cgroup_pids "$scope" | sort -u)"
     if [[ -n "$pids" ]]; then
       log "  scope=$(basename "$scope") pids=${pids}"
-      kill_pids "$pids"
+      kill_pids "$pids" "$aggressive"
     fi
   done < <(find /sys/fs/cgroup -type d -name 'docker-*.scope' 2>/dev/null || true)
 }
 
 kill_processes_in_orphan_pod_slices() {
-  log "杀死 kubepods pod slice 中的残留进程"
+  local aggressive="${1:-false}"
+  log "杀死 kubepods pod slice 中的残留进程 (aggressive=${aggressive})"
   local slice pids
   while IFS= read -r slice; do
     [[ -z "$slice" ]] && continue
     pids="$(get_cgroup_pids "$slice" | sort -u)"
     if [[ -n "$pids" ]]; then
       log "  slice=$(basename "$slice") pids=${pids}"
-      kill_pids "$pids"
+      kill_pids "$pids" "$aggressive"
     fi
   done < <(find /sys/fs/cgroup -type d -path '*/kubepods*' \( \
     -name 'kubepods-*-pod*.slice' -o -name 'kubepods-pod*.slice' \) 2>/dev/null || true)
@@ -615,8 +681,21 @@ force_stop_runtime() {
 }
 
 deep_cleanup_cgroups() {
-  log "========== 开始彻底清理 cgroup =========="
+  log "========== 开始彻底清理 cgroup（先 cgroup 后容器）=========="
 
+  # 第 1 轮：先解冻 FROZEN，再杀 cgroup 内进程
+  thaw_all_frozen_cgroups
+  kill_cgroup_processes_round true
+  sleep 2
+
+  # 第 2 轮：再次解冻 + 杀进程
+  thaw_all_frozen_cgroups
+  kill_cgroup_processes_round true
+  sleep 1
+
+  remove_stale_cgroup_hierarchy
+
+  # 停止运行时（不调用 systemctl stop docker-*.scope，会卡死）
   local runtime
   runtime="$(detect_runtime)"
   case "$runtime" in
@@ -625,16 +704,12 @@ deep_cleanup_cgroups() {
   esac
   sleep 2
 
-  stop_systemd_docker_scopes
-  kill_processes_in_docker_scopes
-  kill_processes_in_orphan_pod_slices
-  sleep 2
+  run_cmd_allow_fail "清理 containerd-shim / docker-shim" bash -c \
+    'pgrep -f "containerd-shim|docker-containerd-shim" | while read p; do kill -9 "$p" 2>/dev/null; done; true'
 
-  # 运行时停止后再杀一次，确保 shim 进程退出
-  kill_processes_in_docker_scopes
-  kill_processes_in_orphan_pod_slices
+  thaw_all_frozen_cgroups
+  kill_cgroup_processes_round true
   sleep 1
-
   remove_stale_cgroup_hierarchy
 
   # 统计仍 busy 的 cgroup
@@ -802,10 +877,11 @@ main() {
   if [[ "$DEEP" == true ]]; then
     run_cmd_allow_fail "停止 kubelet（彻底清理前）" systemctl stop kubelet
     sleep 2
-    force_remove_all_containers
-    cleanup_docker_state_dirs
+    # 顺序：先 cgroup（解冻→杀进程→删目录）→ 再停/启 docker → 最后清容器
     deep_cleanup_cgroups
     restart_container_runtime
+    force_remove_all_containers
+    cleanup_docker_state_dirs
     restart_kubelet
   else
     if [[ "$HARD" == true ]]; then
