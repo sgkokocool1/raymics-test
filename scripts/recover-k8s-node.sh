@@ -30,6 +30,8 @@ DEEP=false
 DIAGNOSE_ONLY=false
 SKIP_CORDON=false
 WAIT_READY_TIMEOUT=300
+DOCKER_CMD_TIMEOUT=30
+RUNTIME_STOP_TIMEOUT=20
 
 usage() {
   cat <<'EOF'
@@ -94,6 +96,43 @@ run_cmd_allow_fail() {
     return 0
   fi
   "$@" >>"$LOG_FILE" 2>&1 || log "    警告: 命令失败 (exit=$?)，继续执行"
+}
+
+# 带超时的命令执行，超时后自动跳过（防止 docker 僵死时无限阻塞）
+run_cmd_timeout() {
+  local secs="$1"
+  local desc="$2"
+  shift 2
+  log ">>> $desc (超时 ${secs}s)"
+  log "    命令: $*"
+  if [[ "$DRY_RUN" == true ]]; then
+    log "    [dry-run] 跳过执行"
+    return 0
+  fi
+  if timeout "$secs" "$@" >>"$LOG_FILE" 2>&1; then
+    log "    完成"
+    return 0
+  else
+    local rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+      log "    超时 (${secs}s)，跳过继续"
+    else
+      log "    失败 (exit=$rc)"
+    fi
+    return "$rc"
+  fi
+}
+
+run_cmd_timeout_allow_fail() {
+  local secs="$1"
+  local desc="$2"
+  shift 2
+  run_cmd_timeout "$secs" "$desc" "$@" || true
+}
+
+docker_responsive() {
+  command -v docker >/dev/null 2>&1 || return 1
+  timeout 5 docker info >/dev/null 2>&1
 }
 
 require_root() {
@@ -285,14 +324,14 @@ uncordon_node() {
 cleanup_stuck_docker() {
   log "清理 Docker 僵死容器与未使用资源"
 
-  # 停止非 kube 管理的异常容器（谨慎：仅清理已退出的）
-  run_cmd_allow_fail "删除已退出容器" docker container prune -f
+  if ! docker_responsive; then
+    log "    Docker 无响应，跳过 prune"
+    return 0
+  fi
 
-  # 清理无引用的网络
-  run_cmd_allow_fail "清理未使用网络" docker network prune -f
-
-  # 列出仍在运行但可能卡死的容器（供日志参考）
-  run_cmd_allow_fail "当前运行中容器" docker ps --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}'
+  run_cmd_timeout_allow_fail 30 "删除已退出容器" docker container prune -f
+  run_cmd_timeout_allow_fail 30 "清理未使用网络" docker network prune -f
+  run_cmd_timeout_allow_fail 10 "当前运行中容器" docker ps --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}'
 }
 
 cleanup_stuck_containerd() {
@@ -323,16 +362,19 @@ force_kill_hung_containers() {
 
   case "$runtime" in
     docker)
-      # 对运行超过 1 天且名称含 task/workflow 的容器发送 SIGKILL（GPU 训练任务常见僵死场景）
+      if ! docker_responsive; then
+        log "    Docker 无响应，跳过 API kill"
+        return 0
+      fi
       while IFS= read -r cid; do
         [[ -z "$cid" ]] && continue
         log "    强制 kill 容器: $cid"
         if [[ "$DRY_RUN" != true ]]; then
-          docker kill -s KILL "$cid" 2>/dev/null || true
+          timeout "$DOCKER_CMD_TIMEOUT" docker kill -s KILL "$cid" 2>/dev/null || true
           sleep 1
-          docker rm -f "$cid" 2>/dev/null || true
+          timeout "$DOCKER_CMD_TIMEOUT" docker rm -f "$cid" 2>/dev/null || true
         fi
-      done < <(docker ps -q 2>/dev/null || true)
+      done < <(timeout "$DOCKER_CMD_TIMEOUT" docker ps -q 2>/dev/null || true)
       ;;
     containerd)
       if command -v crictl >/dev/null 2>&1; then
@@ -463,16 +505,27 @@ force_remove_all_containers() {
 
   case "$runtime" in
     docker)
-      if command -v docker >/dev/null 2>&1; then
-        local ids
-        ids="$(docker ps -aq 2>/dev/null || true)"
-        if [[ -n "$ids" ]]; then
-          log "    docker rm -f: ${ids}"
-          if [[ "$DRY_RUN" != true ]]; then
-            docker kill $(docker ps -q 2>/dev/null) 2>/dev/null || true
-            sleep 2
-            docker rm -f $ids 2>/dev/null || true
-          fi
+      if ! command -v docker >/dev/null 2>&1; then
+        return 0
+      fi
+      if ! docker_responsive; then
+        log "    Docker 无响应，跳过 API 删容器，将通过 cgroup 清理"
+        return 0
+      fi
+      local ids running
+      ids="$(timeout "$DOCKER_CMD_TIMEOUT" docker ps -aq 2>/dev/null || true)"
+      running="$(timeout "$DOCKER_CMD_TIMEOUT" docker ps -q 2>/dev/null || true)"
+      if [[ -n "$running" ]]; then
+        log "    docker kill: ${running}"
+        if [[ "$DRY_RUN" != true ]]; then
+          timeout "$DOCKER_CMD_TIMEOUT" docker kill $running 2>/dev/null || true
+          sleep 2
+        fi
+      fi
+      if [[ -n "$ids" ]]; then
+        log "    docker rm -f: ${ids}"
+        if [[ "$DRY_RUN" != true ]]; then
+          timeout "$DOCKER_CMD_TIMEOUT" docker rm -f $ids 2>/dev/null || true
         fi
       fi
       ;;
@@ -503,30 +556,74 @@ force_remove_all_containers() {
 
 cleanup_docker_state_dirs() {
   log "清理 Docker 运行时残留状态"
-  run_cmd_allow_fail "docker system prune -af" docker system prune -af 2>/dev/null || true
-  # 清理退出的 containerd-shim（若存在）
+
+  if ! docker_responsive; then
+    log "    Docker 无响应，跳过 prune（将通过强制停止 + cgroup 清理）"
+    return 0
+  fi
+
+  # prune 在僵死节点上极易卡死，仅尝试短超时；--deep 模式不依赖此步骤
+  run_cmd_timeout_allow_fail 30 "docker container prune" docker container prune -f
+  run_cmd_timeout_allow_fail 30 "docker network prune" docker network prune -f
+  if [[ "$DEEP" != true ]]; then
+    run_cmd_timeout_allow_fail 60 "docker system prune -af" docker system prune -af
+  else
+    log "    --deep 模式跳过 docker system prune -af（易卡死，改由 cgroup 清理）"
+  fi
+
   run_cmd_allow_fail "清理 containerd-shim 僵尸" bash -c \
     'pgrep -f "containerd-shim" | while read p; do kill -9 "$p" 2>/dev/null; done; true'
+}
+
+force_stop_runtime() {
+  local svc="$1"
+  log "强制停止 ${svc}"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "    [dry-run] systemctl stop ${svc}"
+    return 0
+  fi
+
+  if timeout "$RUNTIME_STOP_TIMEOUT" systemctl stop "$svc" >>"$LOG_FILE" 2>&1; then
+    log "    ${svc} 已正常停止"
+    return 0
+  fi
+
+  log "    systemctl stop 超时/失败，尝试 systemctl kill"
+  timeout 10 systemctl kill --kill-who=all "$svc" >>"$LOG_FILE" 2>&1 || true
+  sleep 2
+
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    log "    仍活跃，SIGKILL 运行时主进程"
+    case "$svc" in
+      docker)
+        pkill -9 -x dockerd 2>/dev/null || pkill -9 -f "/usr/bin/dockerd" 2>/dev/null || true
+        pkill -9 -f "docker-containerd" 2>/dev/null || true
+        ;;
+      containerd)
+        pkill -9 -x containerd 2>/dev/null || pkill -9 -f "/usr/bin/containerd" 2>/dev/null || true
+        ;;
+    esac
+    sleep 2
+  fi
+
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    log "    警告: ${svc} 仍无法停止，可能需要 reboot"
+  else
+    log "    ${svc} 已强制停止"
+  fi
 }
 
 deep_cleanup_cgroups() {
   log "========== 开始彻底清理 cgroup =========="
 
-  run_cmd_allow_fail "停止 kubelet" systemctl stop kubelet
-  sleep 2
-
   local runtime
   runtime="$(detect_runtime)"
   case "$runtime" in
-    docker)
-      run_cmd_allow_fail "停止 docker" systemctl stop docker
-      sleep 3
-      ;;
-    containerd)
-      run_cmd_allow_fail "停止 containerd" systemctl stop containerd
-      sleep 3
-      ;;
+    docker)      force_stop_runtime docker ;;
+    containerd)  force_stop_runtime containerd ;;
   esac
+  sleep 2
 
   stop_systemd_docker_scopes
   kill_processes_in_docker_scopes
