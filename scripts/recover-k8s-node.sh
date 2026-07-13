@@ -13,6 +13,7 @@
 #   sudo ./recover-k8s-node.sh --diagnose   # 仅诊断，不执行恢复
 #   sudo ./recover-k8s-node.sh --force      # 跳过交互确认
 #   sudo ./recover-k8s-node.sh --hard       # 强制清理僵死容器后重启运行时
+#   sudo ./recover-k8s-node.sh --deep       # 彻底清理（cgroup busy / 僵死进程）
 #
 set -euo pipefail
 
@@ -25,6 +26,7 @@ readonly LOG_FILE="${LOG_DIR}/recovery-${TIMESTAMP}.log"
 DRY_RUN=false
 FORCE=false
 HARD=false
+DEEP=false
 DIAGNOSE_ONLY=false
 SKIP_CORDON=false
 WAIT_READY_TIMEOUT=300
@@ -38,6 +40,7 @@ usage() {
   --dry-run         打印将要执行的命令，不实际执行
   --force           跳过交互确认
   --hard            强制模式：清理僵死容器/沙箱后再重启运行时
+  --deep            彻底清理：杀死 cgroup 残留进程、清理僵死 cgroup、强制删除容器
   --skip-cordon     跳过 cordon（若从集群外无法执行 kubectl）
   --wait-timeout N  等待节点 Ready 的超时秒数（默认 300）
   -h, --help        显示帮助
@@ -50,9 +53,10 @@ usage() {
   2. 检查磁盘/inode/内存
   3. cordon 节点（可选）
   4. 重启容器运行时 (containerd/docker)
-  5. 清理僵死容器（--hard 或检测到僵死时）
-  6. 重启 kubelet
-  7. 等待节点恢复 Ready 并 uncordon
+  5. 清理僵死容器（--hard / --deep）
+  6. 清理僵死 cgroup（--deep）
+  7. 重启 kubelet
+  8. 等待节点恢复 Ready 并 uncordon
 EOF
 }
 
@@ -106,6 +110,7 @@ parse_args() {
       --dry-run)      DRY_RUN=true ;;
       --force)        FORCE=true ;;
       --hard)         HARD=true ;;
+      --deep)         DEEP=true; HARD=true ;;
       --skip-cordon)  SKIP_CORDON=true ;;
       --wait-timeout)
         WAIT_READY_TIMEOUT="$2"
@@ -153,9 +158,22 @@ collect_diagnostics() {
   run_cmd_allow_fail "磁盘使用" df -hT
   run_cmd_allow_fail "inode 使用" df -hi
   run_cmd_allow_fail "kubelet 状态" systemctl status kubelet --no-pager -l
-  run_cmd_allow_fail "最近 kubelet 日志 (PLEG/timeout)" \
+  run_cmd_allow_fail "最近 kubelet 日志 (PLEG/timeout/cgroup)" \
     journalctl -u kubelet --since "30 min ago" --no-pager \
-    | grep -E "PLEG|NotReady|timeout|DeadlineExceeded|Skipping pod" | tail -80 || true
+    | grep -E "PLEG|NotReady|timeout|DeadlineExceeded|Skipping pod|cgroup|resource busy" | tail -100 || true
+
+  run_cmd_allow_fail "僵死 cgroup 统计" bash -c '
+    scopes=$(find /sys/fs/cgroup -type d -name "docker-*.scope" 2>/dev/null | wc -l)
+    slices=$(find /sys/fs/cgroup -type d -path "*/kubepods*" -name "kubepods-*-pod*.slice" 2>/dev/null | wc -l)
+    busy=0
+    while IFS= read -r cg; do
+      [[ -f "${cg}/cgroup.procs" ]] || continue
+      if [[ -s "${cg}/cgroup.procs" ]]; then
+        busy=$((busy + 1))
+      fi
+    done < <(find /sys/fs/cgroup -type d -name "docker-*.scope" 2>/dev/null)
+    echo "docker.scope 总数=${scopes}, 仍有进程=${busy}, pod.slice 总数=${slices}"
+  '
 
   local runtime
   runtime="$(detect_runtime)"
@@ -331,6 +349,216 @@ force_kill_hung_containers() {
   esac
 }
 
+# ---------- cgroup 彻底清理 ----------
+
+# 读取 cgroup 内所有 PID（含子 cgroup）
+get_cgroup_pids() {
+  local cgpath="$1"
+  [[ -d "$cgpath" ]] || return 0
+  if [[ -f "${cgpath}/cgroup.procs" ]]; then
+    cat "${cgpath}/cgroup.procs" 2>/dev/null
+  fi
+  local child
+  for child in "$cgpath"/*; do
+    [[ -d "$child" ]] || continue
+    get_cgroup_pids "$child"
+  done
+}
+
+kill_pids() {
+  local pids="$1"
+  local pid
+  for pid in $pids; do
+    [[ -z "$pid" || "$pid" == "0" ]] && continue
+    [[ -d "/proc/${pid}" ]] || continue
+    # 不杀 kubelet/dockerd/containerd 自身
+    local comm
+    comm="$(cat "/proc/${pid}/comm" 2>/dev/null || echo "")"
+    case "$comm" in
+      kubelet|dockerd|containerd|containerd-shim|systemd|sshd) continue ;;
+    esac
+    log "    SIGKILL pid=${pid} comm=${comm}"
+    if [[ "$DRY_RUN" != true ]]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+stop_systemd_docker_scopes() {
+  log "停止 systemd docker scope 单元"
+  local unit
+  while IFS= read -r unit; do
+    [[ -z "$unit" ]] && continue
+    log "    systemctl stop ${unit}"
+    if [[ "$DRY_RUN" != true ]]; then
+      systemctl stop "$unit" 2>/dev/null || true
+    fi
+  done < <(systemctl list-units --type=scope --all --no-legend 2>/dev/null \
+    | awk '/docker-.*\.scope/ {print $1}' || true)
+}
+
+kill_processes_in_docker_scopes() {
+  log "杀死 docker cgroup scope 中的残留进程"
+  local scope pids
+  while IFS= read -r scope; do
+    [[ -z "$scope" ]] && continue
+    pids="$(get_cgroup_pids "$scope" | sort -u)"
+    if [[ -n "$pids" ]]; then
+      log "  scope=$(basename "$scope") pids=${pids}"
+      kill_pids "$pids"
+    fi
+  done < <(find /sys/fs/cgroup -type d -name 'docker-*.scope' 2>/dev/null || true)
+}
+
+kill_processes_in_orphan_pod_slices() {
+  log "杀死 kubepods pod slice 中的残留进程"
+  local slice pids
+  while IFS= read -r slice; do
+    [[ -z "$slice" ]] && continue
+    pids="$(get_cgroup_pids "$slice" | sort -u)"
+    if [[ -n "$pids" ]]; then
+      log "  slice=$(basename "$slice") pids=${pids}"
+      kill_pids "$pids"
+    fi
+  done < <(find /sys/fs/cgroup -type d -path '*/kubepods*' \( \
+    -name 'kubepods-*-pod*.slice' -o -name 'kubepods-pod*.slice' \) 2>/dev/null || true)
+}
+
+remove_empty_cgroup_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  # 仅删除 docker scope 或空 pod slice，不删 kubepods.slice 根
+  case "$(basename "$dir")" in
+    kubepods.slice|kubepods-besteffort.slice|kubepods-burstable.slice) return 0 ;;
+  esac
+  if [[ "$DRY_RUN" == true ]]; then
+    log "    [dry-run] rmdir ${dir}"
+    return 0
+  fi
+  rmdir "$dir" 2>/dev/null && log "    已删除 cgroup: ${dir}" || true
+}
+
+remove_stale_cgroup_hierarchy() {
+  log "尝试删除空的 docker scope / pod slice cgroup 目录"
+
+  # 先删叶子 scope（多控制器各有一份，按深度从深到浅）
+  local dir
+  while IFS= read -r dir; do
+    remove_empty_cgroup_dir "$dir"
+  done < <(find /sys/fs/cgroup -type d -name 'docker-*.scope' 2>/dev/null \
+    | awk '{print length, $0}' | sort -rn | cut -d' ' -f2- || true)
+
+  # 再删空的 pod slice
+  while IFS= read -r dir; do
+    remove_empty_cgroup_dir "$dir"
+  done < <(find /sys/fs/cgroup -type d -path '*/kubepods*' \( \
+    -name 'kubepods-*-pod*.slice' -o -name 'kubepods-pod*.slice' \) 2>/dev/null \
+    | awk '{print length, $0}' | sort -rn | cut -d' ' -f2- || true)
+}
+
+force_remove_all_containers() {
+  local runtime
+  runtime="$(detect_runtime)"
+  log "强制删除所有容器 (runtime=${runtime})"
+
+  case "$runtime" in
+    docker)
+      if command -v docker >/dev/null 2>&1; then
+        local ids
+        ids="$(docker ps -aq 2>/dev/null || true)"
+        if [[ -n "$ids" ]]; then
+          log "    docker rm -f: ${ids}"
+          if [[ "$DRY_RUN" != true ]]; then
+            docker kill $(docker ps -q 2>/dev/null) 2>/dev/null || true
+            sleep 2
+            docker rm -f $ids 2>/dev/null || true
+          fi
+        fi
+      fi
+      ;;
+    containerd)
+      if command -v crictl >/dev/null 2>&1; then
+        local ids
+        ids="$(crictl ps -aq 2>/dev/null || true)"
+        for cid in $ids; do
+          log "    crictl stop/rm: ${cid}"
+          if [[ "$DRY_RUN" != true ]]; then
+            crictl stop -t 3 "$cid" 2>/dev/null || true
+            crictl rm "$cid" 2>/dev/null || true
+          fi
+        done
+        local sandboxes
+        sandboxes="$(crictl pods -q 2>/dev/null || true)"
+        for sid in $sandboxes; do
+          log "    crictl stopp/rmp: ${sid}"
+          if [[ "$DRY_RUN" != true ]]; then
+            crictl stopp "$sid" 2>/dev/null || true
+            crictl rmp "$sid" 2>/dev/null || true
+          fi
+        done
+      fi
+      ;;
+  esac
+}
+
+cleanup_docker_state_dirs() {
+  log "清理 Docker 运行时残留状态"
+  run_cmd_allow_fail "docker system prune -af" docker system prune -af 2>/dev/null || true
+  # 清理退出的 containerd-shim（若存在）
+  run_cmd_allow_fail "清理 containerd-shim 僵尸" bash -c \
+    'pgrep -f "containerd-shim" | while read p; do kill -9 "$p" 2>/dev/null; done; true'
+}
+
+deep_cleanup_cgroups() {
+  log "========== 开始彻底清理 cgroup =========="
+
+  run_cmd_allow_fail "停止 kubelet" systemctl stop kubelet
+  sleep 2
+
+  local runtime
+  runtime="$(detect_runtime)"
+  case "$runtime" in
+    docker)
+      run_cmd_allow_fail "停止 docker" systemctl stop docker
+      sleep 3
+      ;;
+    containerd)
+      run_cmd_allow_fail "停止 containerd" systemctl stop containerd
+      sleep 3
+      ;;
+  esac
+
+  stop_systemd_docker_scopes
+  kill_processes_in_docker_scopes
+  kill_processes_in_orphan_pod_slices
+  sleep 2
+
+  # 运行时停止后再杀一次，确保 shim 进程退出
+  kill_processes_in_docker_scopes
+  kill_processes_in_orphan_pod_slices
+  sleep 1
+
+  remove_stale_cgroup_hierarchy
+
+  # 统计仍 busy 的 cgroup
+  local remaining=0
+  while IFS= read -r cg; do
+    [[ -f "${cg}/cgroup.procs" ]] || continue
+    if [[ -s "${cg}/cgroup.procs" ]]; then
+      remaining=$((remaining + 1))
+      log "  仍 busy: ${cg} pids=$(tr '\n' ' ' < "${cg}/cgroup.procs")"
+    fi
+  done < <(find /sys/fs/cgroup -type d -name 'docker-*.scope' 2>/dev/null || true)
+
+  if [[ "$remaining" -gt 0 ]]; then
+    log "警告: 仍有 ${remaining} 个 cgroup 无法释放，可能需要重启 OS"
+  else
+    log "cgroup 清理完成，无残留 busy scope"
+  fi
+
+  log "========== cgroup 彻底清理结束 =========="
+}
+
 restart_container_runtime() {
   local runtime
   runtime="$(detect_runtime)"
@@ -429,7 +657,10 @@ confirm_recovery() {
   echo "即将对节点 [${node}] 执行恢复操作:"
   echo "  - cordon 节点（若可用）"
   echo "  - 重启容器运行时 + kubelet"
-  if [[ "$HARD" == true ]]; then
+  if [[ "$DEEP" == true ]]; then
+    echo "  - 彻底清理 cgroup 残留进程与目录 (--deep)"
+    echo "  - 强制删除所有容器"
+  elif [[ "$HARD" == true ]]; then
     echo "  - 强制清理僵死容器 (--hard)"
   fi
   echo ""
@@ -453,7 +684,7 @@ main() {
   log "=========================================="
   log "K8s 节点恢复脚本启动"
   log "节点: ${node}"
-  log "参数: diagnose=${DIAGNOSE_ONLY} dry_run=${DRY_RUN} force=${FORCE} hard=${HARD}"
+  log "参数: diagnose=${DIAGNOSE_ONLY} dry_run=${DRY_RUN} force=${FORCE} hard=${HARD} deep=${DEEP}"
   log "=========================================="
 
   collect_diagnostics
@@ -471,20 +702,30 @@ main() {
   # --- 恢复流程 ---
   cordon_node
 
-  if [[ "$HARD" == true ]]; then
-    run_cmd "停止 kubelet（强制清理前）" systemctl stop kubelet
-    force_kill_hung_containers
+  if [[ "$DEEP" == true ]]; then
+    run_cmd_allow_fail "停止 kubelet（彻底清理前）" systemctl stop kubelet
+    sleep 2
+    force_remove_all_containers
+    cleanup_docker_state_dirs
+    deep_cleanup_cgroups
+    restart_container_runtime
+    restart_kubelet
+  else
+    if [[ "$HARD" == true ]]; then
+      run_cmd "停止 kubelet（强制清理前）" systemctl stop kubelet
+      force_kill_hung_containers
+    fi
+
+    local runtime
+    runtime="$(detect_runtime)"
+    case "$runtime" in
+      docker)  cleanup_stuck_docker ;;
+      containerd) cleanup_stuck_containerd ;;
+    esac
+
+    restart_container_runtime
+    restart_kubelet
   fi
-
-  local runtime
-  runtime="$(detect_runtime)"
-  case "$runtime" in
-    docker)  cleanup_stuck_docker ;;
-    containerd) cleanup_stuck_containerd ;;
-  esac
-
-  restart_container_runtime
-  restart_kubelet
 
   if wait_for_node_ready "$node" "$WAIT_READY_TIMEOUT"; then
     uncordon_node
@@ -502,7 +743,8 @@ main() {
     log "  1. journalctl -u kubelet -f"
     log "  2. journalctl -u docker -f  或  journalctl -u containerd -f"
     log "  3. df -h && df -i  (检查磁盘/inode)"
-    log "  4. 若仍失败: 从集群 drain 后重启节点 OS"
+    log "  4. 检查残留 cgroup: find /sys/fs/cgroup -name 'docker-*.scope' -exec cat {}/cgroup.procs \\;"
+    log "  5. 若仍失败: 从集群 drain 后重启节点 OS"
     log "=========================================="
     echo ""
     echo "恢复未完全成功，请查看日志: $LOG_FILE"
